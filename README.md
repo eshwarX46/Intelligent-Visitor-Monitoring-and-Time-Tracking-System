@@ -900,13 +900,17 @@ Long Press = 3 Seconds
 
 ---
 
-## 👨‍💻 Author
+## Author
 
 **Eshwar Prasad Y**
 
 Electronics & Communication Engineering
 
-Embedded Systems | IoT | Arduino | Microcontrollers | Automotive Electronics
+Embedded Systems | IoT | Automotive Electronics | Arduino | Microcontrollers
+
+Email: [eshwargowda313@gmail.com](mailto:eshwargowda313@gmail.com)
+
+LinkedIn: [Eshwar Prasad Y](https://www.linkedin.com/in/eshwar-prasad-y-a3043b370/)
 
 ---
 
