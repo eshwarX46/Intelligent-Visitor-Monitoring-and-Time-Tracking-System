@@ -1,0 +1,1344 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+
+// ======================================================
+// HARDWARE
+// ======================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+RTC_DS3231 rtc;
+
+// Pins
+const byte IR_ENTRY  = 2;
+const byte IR_EXIT   = 3;
+const byte BTN_VIEW  = 5;
+const byte BTN_CLEAR = 6;
+const byte BUZZER    = 7;
+
+
+// ======================================================
+// EEPROM MEMORY MAP
+// ======================================================
+//
+// Address 0 : magic number
+// Address 1 : number of records
+//
+// Each record = 8 bytes
+//
+// Byte 0 : Event type
+//          'I' = ENTRY
+//          'O' = EXIT
+//
+// Byte 1 : Year - 2000
+// Byte 2 : Month
+// Byte 3 : Day
+// Byte 4 : Hour
+// Byte 5 : Minute
+// Byte 6 : Second
+// Byte 7 : Visitors inside after event
+//
+// ======================================================
+
+const int MAGIC_ADDR = 0;
+const int COUNT_ADDR = 1;
+const int DATA_START = 2;
+
+const byte MAGIC_VALUE = 0xA7;
+
+const byte RECORD_SIZE = 8;
+
+// UNO EEPROM = 1024 bytes
+// 2 + (127 × 8) = 1018 bytes
+const byte MAX_RECORDS = 127;
+
+int recordCount = 0;
+int visitorsInside = 0;
+
+
+// ======================================================
+// LCD SCREENS
+// ======================================================
+//
+// Screen 0 = Live status
+// Screen 1 = Date & time
+// Screen 2 = Record 1
+// Screen 3 = Record 2
+// ...
+//
+// ======================================================
+
+int currentScreen = 0;
+
+unsigned long lastLcdRefresh = 0;
+
+const unsigned long LCD_REFRESH_TIME = 250;
+
+
+// ======================================================
+// VIEW BUTTON
+// ======================================================
+
+bool previousViewState = HIGH;
+
+unsigned long lastViewPress = 0;
+
+const unsigned long VIEW_DEBOUNCE = 250;
+
+
+// ======================================================
+// CLEAR BUTTON
+// ======================================================
+
+bool clearButtonDown = false;
+bool clearCompleted = false;
+
+unsigned long clearPressStart = 0;
+
+const unsigned long CLEAR_HOLD_TIME = 3000;
+
+
+// ======================================================
+// ENTRY SENSOR
+// ======================================================
+
+bool entryArmed = true;
+bool entryDetecting = false;
+bool entryClearing = false;
+
+unsigned long entryDetectStart = 0;
+unsigned long entryClearStart = 0;
+
+
+// ======================================================
+// EXIT SENSOR
+// ======================================================
+
+bool exitArmed = true;
+bool exitDetecting = false;
+bool exitClearing = false;
+
+unsigned long exitDetectStart = 0;
+unsigned long exitClearStart = 0;
+
+
+// ======================================================
+// SENSOR FILTERING
+// ======================================================
+
+const unsigned long DETECT_TIME = 120;
+const unsigned long CLEAR_TIME = 500;
+
+
+// ======================================================
+// TEMPORARY LCD MESSAGE
+// ======================================================
+
+bool showingMessage = false;
+
+unsigned long messageStart = 0;
+
+const unsigned long MESSAGE_TIME = 2000;
+
+
+// ======================================================
+// PRINT EXACTLY 16 CHARACTERS ON LCD LINE
+// Prevents old text remaining on screen
+// ======================================================
+
+void printLCDLine(byte row, const char *text) {
+
+  char output[17];
+
+  snprintf(
+    output,
+    sizeof(output),
+    "%-16.16s",
+    text
+  );
+
+  lcd.setCursor(0, row);
+  lcd.print(output);
+}
+
+
+// ======================================================
+// BUZZER
+// ======================================================
+
+void beep() {
+
+  digitalWrite(BUZZER, HIGH);
+
+  delay(100);
+
+  digitalWrite(BUZZER, LOW);
+}
+
+
+// ======================================================
+// PRINT TIME TO SERIAL MONITOR
+// ======================================================
+
+void printTime(DateTime t) {
+
+  if (t.hour() < 10)
+    Serial.print("0");
+
+  Serial.print(t.hour());
+  Serial.print(":");
+
+  if (t.minute() < 10)
+    Serial.print("0");
+
+  Serial.print(t.minute());
+  Serial.print(":");
+
+  if (t.second() < 10)
+    Serial.print("0");
+
+  Serial.print(t.second());
+}
+
+
+// ======================================================
+// EEPROM INITIALIZATION
+// ======================================================
+
+void initializeEEPROM() {
+
+  if (EEPROM.read(MAGIC_ADDR) != MAGIC_VALUE) {
+
+    // First use
+    EEPROM.update(
+      MAGIC_ADDR,
+      MAGIC_VALUE
+    );
+
+    EEPROM.update(
+      COUNT_ADDR,
+      0
+    );
+
+    recordCount = 0;
+    visitorsInside = 0;
+
+    Serial.println(
+      F("EEPROM initialized")
+    );
+  }
+
+  else {
+
+    // Existing memory
+    recordCount =
+      EEPROM.read(COUNT_ADDR);
+
+    // Corruption protection
+    if (recordCount > MAX_RECORDS) {
+
+      recordCount = 0;
+
+      EEPROM.update(
+        COUNT_ADDR,
+        0
+      );
+    }
+
+    // Restore previous occupancy
+    if (recordCount > 0) {
+
+      int lastAddress =
+        DATA_START +
+        ((recordCount - 1) *
+         RECORD_SIZE);
+
+      visitorsInside =
+        EEPROM.read(
+          lastAddress + 7
+        );
+    }
+
+    else {
+
+      visitorsInside = 0;
+    }
+
+    Serial.print(
+      F("Loaded records: ")
+    );
+
+    Serial.println(
+      recordCount
+    );
+
+    Serial.print(
+      F("Restored Inside: ")
+    );
+
+    Serial.println(
+      visitorsInside
+    );
+  }
+}
+
+
+// ======================================================
+// SAVE RECORD
+// ======================================================
+
+bool saveRecord(
+  char eventType,
+  DateTime timeStamp
+) {
+
+  if (recordCount >= MAX_RECORDS) {
+
+    Serial.println(
+      F("WARNING: EEPROM FULL")
+    );
+
+    return false;
+  }
+
+  int address =
+    DATA_START +
+    (recordCount * RECORD_SIZE);
+
+  // Event type
+  EEPROM.update(
+    address + 0,
+    eventType
+  );
+
+  // Date
+  EEPROM.update(
+    address + 1,
+    timeStamp.year() - 2000
+  );
+
+  EEPROM.update(
+    address + 2,
+    timeStamp.month()
+  );
+
+  EEPROM.update(
+    address + 3,
+    timeStamp.day()
+  );
+
+  // Time
+  EEPROM.update(
+    address + 4,
+    timeStamp.hour()
+  );
+
+  EEPROM.update(
+    address + 5,
+    timeStamp.minute()
+  );
+
+  EEPROM.update(
+    address + 6,
+    timeStamp.second()
+  );
+
+  // Occupancy after event
+  EEPROM.update(
+    address + 7,
+    visitorsInside
+  );
+
+  recordCount++;
+
+  EEPROM.update(
+    COUNT_ADDR,
+    recordCount
+  );
+
+  Serial.print(
+    F("Record stored | Total: ")
+  );
+
+  Serial.println(
+    recordCount
+  );
+
+  return true;
+}
+
+
+// ======================================================
+// CLEAR MEMORY
+// ======================================================
+
+void clearRecords() {
+
+  recordCount = 0;
+
+  visitorsInside = 0;
+
+  currentScreen = 0;
+
+  EEPROM.update(
+    COUNT_ADDR,
+    0
+  );
+
+  // Prevent an object already standing in
+  // front of a sensor from being counted
+  // immediately after memory clear.
+
+  entryDetecting = false;
+  entryClearing = false;
+
+  exitDetecting = false;
+  exitClearing = false;
+
+  entryArmed =
+    (digitalRead(IR_ENTRY) == HIGH);
+
+  exitArmed =
+    (digitalRead(IR_EXIT) == HIGH);
+
+
+  lcd.clear();
+
+  printLCDLine(
+    0,
+    "MEMORY CLEARED"
+  );
+
+  printLCDLine(
+    1,
+    "Stored Recs:  0"
+  );
+
+
+  Serial.println();
+
+  Serial.println(
+    F("====================")
+  );
+
+  Serial.println(
+    F("EEPROM DATA CLEARED")
+  );
+
+  Serial.println(
+    F("====================")
+  );
+
+
+  // Two confirmation beeps
+  beep();
+
+  delay(100);
+
+  beep();
+
+  delay(1000);
+
+  lastLcdRefresh = 0;
+}
+
+
+// ======================================================
+// ENTRY / EXIT EVENT DISPLAY
+// ======================================================
+
+void showEvent(
+  bool isEntry,
+  DateTime now
+) {
+
+  char line2[17];
+
+  lcd.clear();
+
+  if (isEntry) {
+
+    printLCDLine(
+      0,
+      "ENTRY DETECTED"
+    );
+  }
+
+  else {
+
+    printLCDLine(
+      0,
+      "EXIT DETECTED"
+    );
+  }
+
+
+  // Example:
+  // Inside:005 16:42
+
+  snprintf(
+    line2,
+    sizeof(line2),
+    "Inside:%03d %02d:%02d",
+    visitorsInside,
+    now.hour(),
+    now.minute()
+  );
+
+  printLCDLine(
+    1,
+    line2
+  );
+
+  showingMessage = true;
+
+  messageStart = millis();
+}
+
+
+// ======================================================
+// EXIT IGNORED DISPLAY
+// ======================================================
+
+void showExitIgnored() {
+
+  lcd.clear();
+
+  printLCDLine(
+    0,
+    "EXIT IGNORED"
+  );
+
+  printLCDLine(
+    1,
+    "Nobody is inside"
+  );
+
+  showingMessage = true;
+
+  messageStart = millis();
+}
+
+
+// ======================================================
+// LIVE SCREEN
+// ======================================================
+
+void showLiveScreen() {
+
+  char line1[17];
+  char line2[17];
+
+  // Example:
+  //
+  // Inside Now:  5
+  // Stored Recs: 24
+
+  snprintf(
+    line1,
+    sizeof(line1),
+    "Inside Now:%3d",
+    visitorsInside
+  );
+
+  snprintf(
+    line2,
+    sizeof(line2),
+    "Stored Recs:%3d",
+    recordCount
+  );
+
+  printLCDLine(
+    0,
+    line1
+  );
+
+  printLCDLine(
+    1,
+    line2
+  );
+}
+
+
+// ======================================================
+// DATE / TIME SCREEN
+// ======================================================
+
+void showDateTimeScreen(
+  DateTime now
+) {
+
+  char line1[17];
+  char line2[17];
+
+  // Example:
+  //
+  // Date:13/10/2026
+  // Time:16:42:35
+
+  snprintf(
+    line1,
+    sizeof(line1),
+    "Date:%02d/%02d/%04d",
+    now.day(),
+    now.month(),
+    now.year()
+  );
+
+  snprintf(
+    line2,
+    sizeof(line2),
+    "Time:%02d:%02d:%02d",
+    now.hour(),
+    now.minute(),
+    now.second()
+  );
+
+  printLCDLine(
+    0,
+    line1
+  );
+
+  printLCDLine(
+    1,
+    line2
+  );
+}
+
+
+// ======================================================
+// STORED RECORD SCREEN
+// ======================================================
+
+void showRecordScreen(
+  int index
+) {
+
+  if (
+    index < 0 ||
+    index >= recordCount
+  ) {
+
+    return;
+  }
+
+  int address =
+    DATA_START +
+    (index * RECORD_SIZE);
+
+
+  char eventType =
+    EEPROM.read(
+      address + 0
+    );
+
+  int month =
+    EEPROM.read(
+      address + 2
+    );
+
+  int day =
+    EEPROM.read(
+      address + 3
+    );
+
+  int hour =
+    EEPROM.read(
+      address + 4
+    );
+
+  int minute =
+    EEPROM.read(
+      address + 5
+    );
+
+  int second =
+    EEPROM.read(
+      address + 6
+    );
+
+  int inside =
+    EEPROM.read(
+      address + 7
+    );
+
+
+  char line1[17];
+  char line2[17];
+
+
+  // ENTRY example:
+  //
+  // R001 ENTRY 13/10
+  // 16:20:04 Now:001
+
+  if (eventType == 'I') {
+
+    snprintf(
+      line1,
+      sizeof(line1),
+      "R%03d ENTRY %02d/%02d",
+      index + 1,
+      day,
+      month
+    );
+  }
+
+  else {
+
+    // EXIT example:
+    //
+    // R003 EXIT 13/10
+
+    snprintf(
+      line1,
+      sizeof(line1),
+      "R%03d EXIT %02d/%02d",
+      index + 1,
+      day,
+      month
+    );
+  }
+
+
+  snprintf(
+    line2,
+    sizeof(line2),
+    "%02d:%02d:%02d Now:%03d",
+    hour,
+    minute,
+    second,
+    inside
+  );
+
+
+  printLCDLine(
+    0,
+    line1
+  );
+
+  printLCDLine(
+    1,
+    line2
+  );
+}
+
+
+// ======================================================
+// DISPLAY CURRENT SCREEN
+// ======================================================
+
+void refreshNormalScreen(
+  DateTime now
+) {
+
+  if (currentScreen == 0) {
+
+    showLiveScreen();
+  }
+
+  else if (currentScreen == 1) {
+
+    showDateTimeScreen(now);
+  }
+
+  else {
+
+    int recordIndex =
+      currentScreen - 2;
+
+    showRecordScreen(
+      recordIndex
+    );
+  }
+}
+
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+
+  pinMode(
+    IR_ENTRY,
+    INPUT
+  );
+
+  pinMode(
+    IR_EXIT,
+    INPUT
+  );
+
+
+  pinMode(
+    BTN_VIEW,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    BTN_CLEAR,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BUZZER,
+    OUTPUT
+  );
+
+  digitalWrite(
+    BUZZER,
+    LOW
+  );
+
+
+  lcd.init();
+
+  lcd.backlight();
+
+
+  // RTC check
+  if (!rtc.begin()) {
+
+    lcd.clear();
+
+    printLCDLine(
+      0,
+      "RTC NOT FOUND"
+    );
+
+    printLCDLine(
+      1,
+      "Check wiring"
+    );
+
+    Serial.println(
+      F("ERROR: RTC NOT FOUND")
+    );
+
+    while (1);
+  }
+
+
+  // IMPORTANT:
+  //
+  // RTC is already set.
+  // Keep this COMMENTED.
+  //
+  // Do not enable it again during normal use.
+  //
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // Warn if RTC backup was lost
+  if (rtc.lostPower()) {
+
+    Serial.println(
+      F("WARNING: RTC reports lost power")
+    );
+  }
+
+
+  initializeEEPROM();
+
+
+  // Startup screen
+  lcd.clear();
+
+  printLCDLine(
+    0,
+    "VISITOR SYSTEM"
+  );
+
+  char startLine[17];
+
+  snprintf(
+    startLine,
+    sizeof(startLine),
+    "Stored Recs:%3d",
+    recordCount
+  );
+
+  printLCDLine(
+    1,
+    startLine
+  );
+
+
+  delay(1500);
+
+  lcd.clear();
+
+  lastLcdRefresh = 0;
+}
+
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+
+void loop() {
+
+  DateTime now =
+    rtc.now();
+
+
+  int entryState =
+    digitalRead(
+      IR_ENTRY
+    );
+
+  int exitState =
+    digitalRead(
+      IR_EXIT
+    );
+
+
+  // ==================================================
+  // CLEAR BUTTON
+  // ==================================================
+
+  if (
+    digitalRead(BTN_CLEAR)
+    == LOW
+  ) {
+
+    if (!clearButtonDown) {
+
+      clearButtonDown = true;
+
+      clearCompleted = false;
+
+      clearPressStart =
+        millis();
+
+      lcd.clear();
+
+      printLCDLine(
+        0,
+        "Hold 3 sec..."
+      );
+
+      printLCDLine(
+        1,
+        "to clear records"
+      );
+    }
+
+
+    if (
+      !clearCompleted &&
+      millis() -
+      clearPressStart >=
+      CLEAR_HOLD_TIME
+    ) {
+
+      clearRecords();
+
+      clearCompleted = true;
+
+      showingMessage = false;
+    }
+
+
+    delay(10);
+
+    // Ignore sensors and VIEW
+    // while CLEAR is held.
+    return;
+  }
+
+
+  else {
+
+    if (clearButtonDown) {
+
+      clearButtonDown = false;
+
+      clearCompleted = false;
+
+      lcd.clear();
+
+      lastLcdRefresh = 0;
+    }
+  }
+
+
+  // ==================================================
+  // VIEW BUTTON
+  // ==================================================
+
+  bool viewState =
+    digitalRead(
+      BTN_VIEW
+    );
+
+
+  if (
+    viewState == LOW &&
+    previousViewState == HIGH &&
+    millis() -
+    lastViewPress >
+    VIEW_DEBOUNCE
+  ) {
+
+    lastViewPress =
+      millis();
+
+
+    // Leave temporary entry/exit screen
+    showingMessage = false;
+
+
+    currentScreen++;
+
+
+    // 0 = live
+    // 1 = date/time
+    // 2... = records
+
+    int maxScreen =
+      recordCount + 1;
+
+
+    if (
+      currentScreen >
+      maxScreen
+    ) {
+
+      currentScreen = 0;
+    }
+
+
+    lcd.clear();
+
+    refreshNormalScreen(
+      now
+    );
+
+
+    Serial.print(
+      F("LCD Screen: ")
+    );
+
+    Serial.println(
+      currentScreen
+    );
+
+
+    lastLcdRefresh =
+      millis();
+  }
+
+
+  previousViewState =
+    viewState;
+
+
+  // ==================================================
+  // ENTRY SENSOR
+  // ==================================================
+
+  if (entryArmed) {
+
+    if (entryState == LOW) {
+
+      if (!entryDetecting) {
+
+        entryDetecting = true;
+
+        entryDetectStart =
+          millis();
+      }
+
+
+      if (
+        millis() -
+        entryDetectStart >=
+        DETECT_TIME
+      ) {
+
+        visitorsInside++;
+
+
+        entryArmed = false;
+
+        entryDetecting = false;
+
+
+        saveRecord(
+          'I',
+          now
+        );
+
+
+        beep();
+
+
+        Serial.print(
+          F("ENTRY detected | Inside: ")
+        );
+
+        Serial.print(
+          visitorsInside
+        );
+
+        Serial.print(
+          F(" | Time: ")
+        );
+
+        printTime(now);
+
+        Serial.println();
+
+
+        showEvent(
+          true,
+          now
+        );
+      }
+    }
+
+
+    else {
+
+      entryDetecting =
+        false;
+    }
+  }
+
+
+  else {
+
+    // Wait until sensor is
+    // fully clear
+
+    if (entryState == HIGH) {
+
+      if (!entryClearing) {
+
+        entryClearing = true;
+
+        entryClearStart =
+          millis();
+      }
+
+
+      if (
+        millis() -
+        entryClearStart >=
+        CLEAR_TIME
+      ) {
+
+        entryArmed = true;
+
+        entryClearing = false;
+
+
+        Serial.println(
+          F("ENTRY sensor ready again")
+        );
+      }
+    }
+
+
+    else {
+
+      entryClearing =
+        false;
+    }
+  }
+
+
+  // ==================================================
+  // EXIT SENSOR
+  // ==================================================
+
+  if (exitArmed) {
+
+    if (exitState == LOW) {
+
+      if (!exitDetecting) {
+
+        exitDetecting = true;
+
+        exitDetectStart =
+          millis();
+      }
+
+
+      if (
+        millis() -
+        exitDetectStart >=
+        DETECT_TIME
+      ) {
+
+        // Valid exit only when
+        // at least one visitor
+        // is currently inside.
+
+        if (
+          visitorsInside > 0
+        ) {
+
+          visitorsInside--;
+
+
+          saveRecord(
+            'O',
+            now
+          );
+
+
+          beep();
+
+
+          Serial.print(
+            F("EXIT detected | Inside: ")
+          );
+
+          Serial.print(
+            visitorsInside
+          );
+
+          Serial.print(
+            F(" | Time: ")
+          );
+
+          printTime(now);
+
+          Serial.println();
+
+
+          showEvent(
+            false,
+            now
+          );
+        }
+
+
+        else {
+
+          Serial.println(
+            F(
+              "EXIT ignored | "
+              "Inside already 0"
+            )
+          );
+
+
+          showExitIgnored();
+        }
+
+
+        exitArmed = false;
+
+        exitDetecting = false;
+      }
+    }
+
+
+    else {
+
+      exitDetecting =
+        false;
+    }
+  }
+
+
+  else {
+
+    // Wait until sensor is
+    // completely clear.
+
+    if (exitState == HIGH) {
+
+      if (!exitClearing) {
+
+        exitClearing = true;
+
+        exitClearStart =
+          millis();
+      }
+
+
+      if (
+        millis() -
+        exitClearStart >=
+        CLEAR_TIME
+      ) {
+
+        exitArmed = true;
+
+        exitClearing = false;
+
+
+        Serial.println(
+          F("EXIT sensor ready again")
+        );
+      }
+    }
+
+
+    else {
+
+      exitClearing =
+        false;
+    }
+  }
+
+
+  // ==================================================
+  // TEMPORARY ENTRY / EXIT MESSAGE
+  // ==================================================
+
+  if (showingMessage) {
+
+    if (
+      millis() -
+      messageStart >=
+      MESSAGE_TIME
+    ) {
+
+      showingMessage = false;
+
+      lcd.clear();
+
+      refreshNormalScreen(
+        now
+      );
+
+      lastLcdRefresh =
+        millis();
+    }
+  }
+
+
+  // ==================================================
+  // NORMAL LCD REFRESH
+  // ==================================================
+
+  else {
+
+    if (
+      millis() -
+      lastLcdRefresh >=
+      LCD_REFRESH_TIME
+    ) {
+
+      refreshNormalScreen(
+        now
+      );
+
+      lastLcdRefresh =
+        millis();
+    }
+  }
+
+
+  delay(10);
+}
